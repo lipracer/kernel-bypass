@@ -1,0 +1,1010 @@
+From f41f1ce82058901baca84373c5353a3b20157361 Mon Sep 17 00:00:00 2001
+From: lipracer <lipracer@gmail.com>
+Date: Wed, 23 Aug 2023 18:00:31 +0800
+Subject: [PATCH] add a pass replace call cuda kernel with call custom kernel
+
+---
+ .../BypassCudaKernel/BypassCudaKernel.cpp     | 910 ++++++++++++++++++
+ .../BypassCudaKernel/BypassCudaKernel.exports |   0
+ .../BypassCudaKernel/BypassCudaKernel.h       |  23 +
+ .../BypassCudaKernel/CMakeLists.txt           |  23 +
+ llvm/lib/Transforms/CMakeLists.txt            |   1 +
+ 5 files changed, 957 insertions(+)
+ create mode 100644 llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.cpp
+ create mode 100644 llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.exports
+ create mode 100644 llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.h
+ create mode 100644 llvm/lib/Transforms/BypassCudaKernel/CMakeLists.txt
+
+diff --git a/llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.cpp b/llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.cpp
+new file mode 100644
+index 000000000000..fbae2fdc8d64
+--- /dev/null
++++ b/llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.cpp
+@@ -0,0 +1,910 @@
++#include "./BypassCudaKernel.h"
++#include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/SmallString.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/ADT/ilist.h"
++#include "llvm/ADT/iterator_range.h"
++#include "llvm/Analysis/CallGraph.h"
++#include "llvm/Demangle/Demangle.h"
++#include "llvm/IR/Comdat.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/GlobalAlias.h"
++#include "llvm/IR/GlobalObject.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Value.h"
++#include "llvm/IR/ValueSymbolTable.h"
++#include "llvm/InitializePasses.h"
++#include "llvm/Pass.h"
++#include "llvm/Passes/PassBuilder.h"
++#include "llvm/Passes/PassPlugin.h"
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/ErrorOr.h"
++#include "llvm/Support/MemoryBuffer.h"
++#include "llvm/Support/Regex.h"
++#include "llvm/Support/SourceMgr.h"
++#include "llvm/Support/YAMLParser.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include <fstream>
++#include <memory>
++#include <sstream>
++#include <string>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++using namespace llvm;
++
++static cl::opt<std::string> symbol_map("symbol-map", cl::init(""),
++                                       cl::desc("path of symbol-map"));
++
++constexpr char SYM_EXPORT_PATH[] = "SYM_EXPORT_PATH";
++constexpr char DUMP_MODULE_BEFORE[] = "DUMP_MODULE_BEFORE";
++constexpr char DUMP_MODULE_AFTER[] = "DUMP_MODULE_AFTER";
++constexpr char DEBUG_FUNC_NAME[] = "DEBUG_FUNC_NAME";
++constexpr char CUSTOM_MANGLE_HEADER[] = "CUSTOM_MANGLE_HEADER";
++constexpr char AGGRESSIVE_MATCH[] = "AGGRESSIVE_MATCH";
++constexpr char FORWARD_TO_CPU[] = "FORWARD_TO_CPU";
++constexpr char BYPASS_FILE_FILTER[] = "BYPASS_FILE_FILTER";
++
++template <typename T> inline T getEnvValueAs(const char *str) {
++  std::stringstream ss;
++  const auto *env_str = std::getenv(str);
++  if (!env_str) {
++    return {};
++  }
++  ss << env_str;
++  T t;
++  ss >> t;
++  return t;
++}
++
++template <> inline bool getEnvValueAs<bool>(const char *str) {
++  auto env_str = std::getenv(str);
++  if (env_str &&
++      (std::atoi(env_str) || StringRef(env_str).equals_lower("true"))) {
++    return true;
++  }
++  return false;
++}
++
++static bool gEnableLog = false;
++#define DEBUG_TYPE "cuda_kernel_bypass"
++#define DEBUG_L errs() << __LINE__ << "\n";
++#define DEBUG_EXPR(expr)                                                       \
++  do {                                                                         \
++    if (gEnableLog)                                                            \
++      expr;                                                                    \
++  } while (0);
++
++namespace {
++
++class BypassCudaKernelLegacyPass : public ModulePass {
++public:
++  static char ID; // Pass identification, replacement for typeid
++
++  BypassCudaKernelLegacyPass();
++
++  bool runOnModule(Module &M) override;
++
++  // StringRef getPassName() const final { return "BypassCudaKernelLegacyPass"; }
++
++  // void print(raw_ostream &OS, const Module *M) const final {
++  //   M->print(OS, nullptr);
++  // }
++
++  // Pass *createPrinterPass(raw_ostream &OS,
++  //                         const std::string &Banner) const final {
++  //   OS << Banner;
++  //   // return this;
++  //   return nullptr;
++  // }
++
++  // void assignPassManager(PMStack &PMS, PassManagerType T) final {}
++
++private:
++  BypassCudaKernelPass Impl;
++};
++
++} // end anonymous namespace
++
++char BypassCudaKernelLegacyPass::ID = 0;
++static RegisterPass<BypassCudaKernelLegacyPass> X("bypass-cuda-kernel",
++                                                  "BypassCudaKernelLegacyPass");
++
++BypassCudaKernelLegacyPass::BypassCudaKernelLegacyPass() : ModulePass(ID) {
++}
++
++bool BypassCudaKernelLegacyPass::runOnModule(Module &M) {
++  return Impl.runImpl(M);
++}
++
++PreservedAnalyses BypassCudaKernelPass::run(Module &M,
++                                            ModuleAnalysisManager &AM) {
++  if (!runImpl(M))
++    return PreservedAnalyses::all();
++
++  return PreservedAnalyses::none();
++}
++
++// cuda launch kernel call stack like this:
++//                      cudaLaunchKernel
++//                            |
++// _ZL16cudaLaunchKernelIcE9cudaErrorPKT_4dim3S4_PPvmP11CUstream_st
++//                            |
++// --------------------------------------------------------------
++//              |                                 |
++// _Z24__device_stub__Z3addiiPiiiPi     device_stub_otherxxx_kernel
++//              |                                 |
++//          _Z3addiiPi                      otherxxx_kernel
++// make post order map search kernel from root node: cudaLaunchKernel
++
++namespace {
++
++static const char *custom_mangle_header() {
++  auto H = getEnvValueAs<std::string>(CUSTOM_MANGLE_HEADER);
++  if (H.empty()) {
++    return "xpu_kernel_";
++  }
++  return H.c_str();
++}
++
++static size_t custom_mangle_header_len() {
++  static size_t size = strlen(custom_mangle_header());
++  return size;
++}
++
++template <typename T> struct TWrapperBase {
++  TWrapperBase(const T &t) : t_(t) {}
++
++  operator T() { return t_; }
++  const T &value() const { return t_; }
++  T &value() { return t_; }
++
++private:
++  T t_;
++};
++
++struct TWrapper : public TWrapperBase<std::string> {
++  TWrapper(const std::string &t) : TWrapperBase<std::string>(t) {
++    if (StringRef(value()).startswith(custom_mangle_header())) {
++      header_ = custom_mangle_header();
++      body_ = StringRef(value()).drop_front(custom_mangle_header_len());
++    } else {
++      body_ = StringRef(value());
++    }
++  }
++  friend bool operator==(const TWrapper &lhs, const TWrapper &rhs);
++  friend bool operator!=(const TWrapper &lhs, const TWrapper &rhs);
++  friend raw_ostream &operator<<(raw_ostream &os, const TWrapper &rhs);
++
++  StringRef body() const { return body_; }
++
++private:
++  StringRef header_;
++  StringRef body_;
++};
++
++/// note: std::unordered_map use operator==
++/// std::map must operator <
++bool operator==(const TWrapper &lhs, const TWrapper &rhs) {
++  if (&lhs == &rhs) {
++    return true;
++  }
++  return lhs.body_.equals(rhs.body_);
++}
++
++bool operator!=(const TWrapper &lhs, const TWrapper &rhs) {
++  return !(lhs == rhs);
++}
++
++raw_ostream &operator<<(raw_ostream &os, const TWrapper &rhs) {
++  os << "header:" << rhs.header_ << " body:" << rhs.body_;
++  return os;
++}
++
++struct WrapperHasher {
++  auto operator()(const TWrapper &str) const {
++    auto hash_code = llvm::hash_value(str.body());
++    return hash_value(hash_code);
++  }
++};
++
++class FunctionDesc {
++public:
++  FunctionDesc(StringRef name) {}
++
++private:
++  StringRef fullName;
++  std::vector<std::string> parsedArgTypes_;
++};
++
++class FunctionMatcher {
++public:
++  using StringRefRange =
++      std::tuple<StringRef::const_iterator, StringRef::const_iterator>;
++  FunctionMatcher() {
++    loadSymbol();
++    for (StringRef exportSymbol : exportSymbols_) {
++      std::string functionName;
++      std::vector<std::string> vargs;
++      std::tie(functionName, vargs) = parse_function_info(
++          llvm::demangle(filteReturnType(exportSymbol).str()));
++      auto arg_info = std::make_tuple(exportSymbol, vargs);
++      auto iter = symbol_map_.find(functionName);
++      if (iter == symbol_map_.end()) {
++        symbol_map_.insert(std::make_pair(
++            functionName,
++            std::vector<std::tuple<StringRef, std::vector<std::string>>>{
++                arg_info}));
++      } else {
++        iter->second.push_back(arg_info);
++      }
++    }
++    DEBUG_EXPR(dump());
++  }
++
++  void dump() {
++    for (auto &symbol_info : symbol_map_) {
++      errs() << "c name:" << symbol_info.first.value() << "\n";
++      for (auto &args : symbol_info.second) {
++        errs() << "arg types:";
++        for (auto &type : std::get<1>(args)) {
++          errs() << "|" << type << "| ";
++        }
++        errs() << "\n";
++      }
++    }
++  }
++
++  StringRef filteReturnType(StringRef name) {
++    auto header = custom_mangle_header();
++    size_t pos = name.find(header);
++    if (pos == std::string::npos) {
++      return name;
++    }
++    return name.drop_front(custom_mangle_header_len());
++  }
++
++  SmallVector<StringRef, 16> filteToken(ArrayRef<StringRef> args, char token) {
++    SmallVector<StringRef, 16> result;
++    for (auto arg : args) {
++      SmallVector<StringRef, 4> splited;
++      arg.split(splited, token, -1, false);
++      for (auto &str : splited) {
++        str = str.rtrim();
++        str = str.ltrim();
++      }
++      result.append(splited.begin(), splited.end());
++    }
++    return result;
++  }
++
++  std::tuple<std::string, std::vector<std::string>>
++  parse_function_info(StringRef name) {
++    StringRefRange tem_range =
++        template_filer<'<', '>'>(std::begin(name), std::end(name), 1);
++    StringRefRange args_range =
++        template_filer<')', '('>(std::end(name) - 1, std::begin(name) - 1, -1);
++    StringRef functionName;
++    // has template param
++    if (std::get<0>(tem_range) != std::get<1>(tem_range)) {
++      // push function name
++      functionName = StringRef(std::begin(name),
++                               std::get<0>(tem_range) - std::begin(name));
++    } else {
++      functionName = StringRef(std::begin(name),
++                               std::get<1>(args_range) - std::begin(name));
++    }
++    auto args_str = StringRef(std::get<1>(args_range) + 1,
++                              name.end() - std::get<1>(args_range) - 2);
++    SmallVector<StringRef, 4> vargs;
++    if (!args_str.empty()) {
++      args_str.split(vargs, ',', -1, false);
++      for (auto &str : vargs) {
++        str = str.rtrim();
++        str = str.ltrim();
++      }
++      vargs = filteToken(vargs, '<');
++      vargs = filteToken(vargs, '>');
++    }
++
++    std::vector<std::string> _vargs(vargs.size());
++    std::transform(vargs.begin(), vargs.end(), _vargs.begin(),
++                   [](auto str) { return str.str(); });
++    return std::make_tuple(functionName.str(), _vargs);
++  }
++
++  template <char l, char r, typename IterT>
++  std::tuple<IterT, IterT> template_filer(IterT begin, IterT end,
++                                          int64_t diff) {
++    llvm::SmallVector<char, 64> stack;
++    auto match_start = end;
++    auto iter = begin;
++    for (; iter != end; std::advance(iter, diff)) {
++      if (*iter == l) {
++        match_start = iter;
++        stack.push_back(*iter);
++      } else if (*iter == r) {
++        stack.pop_back();
++      }
++      if (match_start != end && stack.empty()) {
++        return std::make_tuple(match_start, iter);
++      }
++    }
++    return std::make_tuple(iter, iter);
++  }
++
++  void match(StringRef srcName) {
++    foundSymbol_ = {};
++    std::string functionName;
++    std::vector<std::string> vargs;
++    auto _srcName = srcName.str();
++    auto srcDemangledName = llvm::demangle(_srcName);
++    if (srcDemangledName == _srcName) {
++      // errs() << "demangle fail:" << _srcName << "\n";
++      return;
++    }
++    DEBUG_EXPR(errs() << "source cuda function:\n"
++                      << llvm::demangle(srcDemangledName) << "\n");
++    std::tie(functionName, vargs) = parse_function_info(srcDemangledName);
++    auto iter = symbol_map_.find(functionName);
++    if (iter == symbol_map_.end()) {
++      DEBUG_EXPR(errs() << "can't find the symbol in the export file!\n");
++      return;
++    }
++    DEBUG_EXPR(errs() << "visit custom function:\n");
++    for (auto &ivargs : iter->second) {
++      ArrayRef<std::string> lhsArs = std::get<1>(ivargs);
++      ArrayRef<std::string> rhsArs = vargs;
++      DEBUG_EXPR(errs() << llvm::demangle(std::get<0>(ivargs).str()) << "\n");
++      if (matchArgs<std::true_type>(lhsArs.drop_front(2), rhsArs)) {
++        foundSymbol_ = std::get<0>(ivargs);
++        return;
++      }
++    }
++    return;
++  }
++
++  template <typename DebugT>
++  bool matchArgs(ArrayRef<std::string> lhs, ArrayRef<std::string> rhs) {
++    if (lhs.size() != rhs.size()) {
++      return false;
++    }
++    SmallVector<std::tuple<size_t, std::string, std::string>, 4> mismatch;
++    for (const auto &it : enumerate(zip(lhs, rhs))) {
++      if (!matchArgType(std::get<0>(it.value()), std::get<1>(it.value()))) {
++        mismatch.emplace_back(it.index(), std::get<0>(it.value()),
++                              std::get<1>(it.value()));
++      }
++    }
++    for (auto &it : mismatch) {
++      DEBUG_EXPR(errs() << "mismatch:[" << std::get<0>(it)
++                        << "] lhs:" << std::get<1>(it)
++                        << " vs rhs:" << std::get<2>(it) << "\n");
++    }
++    DEBUG_EXPR(errs() << "\n");
++    return mismatch.empty();
++  }
++
++  template <typename DebugT, typename = std::enable_if_t<!DebugT::value>>
++  bool matchArgs(ArrayRef<std::string> lhs, ArrayRef<std::string> rhs) {
++    if (lhs.size() != rhs.size()) {
++      return false;
++    }
++    for (const auto &it : enumerate(zip(lhs, rhs))) {
++      if (!matchArgType(std::get<0>(it.value()), std::get<1>(it.value()))) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  bool matchArgType(StringRef lhs, StringRef rhs) {
++    if (lhs == rhs) {
++      return true;
++    }
++    // static bool aggressiveMatch = getEnvValueAs<bool>(AGGRESSIVE_MATCH);
++    static bool aggressiveMatch = true;
++    if (aggressiveMatch) {
++      return aggressiveMatchArgType(lhs, rhs);
++    }
++    return false;
++  }
++
++  bool aggressiveMatchArgType(StringRef lhs, StringRef rhs) {
++    bool ignoreSign = false;
++    if (ignoreSign) {
++      auto diff =
++          lhs.size() > rhs.size() ? minus_str(lhs, rhs) : minus_str(rhs, lhs);
++      if (diff == "unsigned ") {
++        return true;
++      }
++    }
++    // TODO refine this
++    static llvm::DenseMap<StringRef, llvm::DenseSet<StringRef>> typeMap = {
++        {"bool", {"unsigned char", "char"}},
++        {"unsigned char", {"bool"}},
++        {"long", {"long long"}},
++        {"long long", {"long"}},
++
++        {"long *", {"long long *"}},
++        {"long long *", {"long *"}},
++
++        {"long const*", {"long long const*"}},
++        {"long long const*", {"long const*"}},
++    };
++    auto iter = typeMap.find(lhs);
++    if (iter != typeMap.end() && iter->second.find(rhs) != iter->second.end()) {
++      DEBUG_EXPR(errs() << "warning aggressive match success:" << lhs << " vs "
++                        << rhs << "\n");
++      return true;
++    }
++    return false;
++  }
++
++  StringRef minus_str(StringRef lhs, StringRef rhs) {
++    if (lhs.empty()) {
++      {};
++    }
++    if (rhs.empty()) {
++      return lhs;
++    }
++    auto lhsB = lhs.begin();
++    auto rhsB = rhs.begin();
++    auto lhsE = lhs.end() - 1;
++    auto rhsE = rhs.end() - 1;
++    while (lhsB != lhs.end() && rhsB != rhs.end() && *lhsB == *rhsB) {
++      lhsB++;
++      rhsB++;
++    }
++    while (lhsE != lhs.begin() && rhsE != rhs.begin() && *lhsE == *rhsE) {
++      lhsE--;
++      rhsE--;
++    }
++    if (rhsB != rhsE) {
++      return {};
++    }
++    return StringRef(lhsB, lhsE - lhsB);
++  }
++
++  StringRef getFoundSymbol() { return foundSymbol_; }
++
++  void loadSymbol() {
++    auto path = std::getenv(SYM_EXPORT_PATH);
++    if (!path) {
++      path = "/tmp/xtrans_symbol.exports";
++    }
++    std::ifstream ifs(path);
++    if (!ifs.is_open()) {
++      return;
++    }
++    std::string line;
++    while (std::getline(ifs, line)) {
++      if (line.empty()) {
++        continue;
++      }
++      exportSymbols_.emplace_back(line);
++    }
++  }
++
++private:
++  // TODO: need std::map, lhs and rhs always not equal, so those hasher not
++  // equal yet
++  std::unordered_map<
++      TWrapper, std::vector<std::tuple<StringRef, std::vector<std::string>>>,
++      WrapperHasher>
++      symbol_map_;
++  StringRef foundSymbol_;
++  SmallVector<std::string, 64> exportSymbols_;
++};
++} // namespace
++
++void BypassCudaKernelPass::enableLog(Module &M) {
++  auto debugType = getEnvValueAs<std::string>(DEBUG_TYPE);
++  if (debugType == "all") {
++    gEnableLog = true;
++  }
++  if (!debugType.empty() &&
++      M.getSourceFileName().find(debugType) != std::string::npos) {
++    gEnableLog = true;
++  }
++}
++
++bool BypassCudaKernelPass::skip(Module &M) {
++  auto filter = getEnvValueAs<std::string>(BYPASS_FILE_FILTER);
++  if (filter.empty() ||
++      M.getSourceFileName().find(filter) != std::string::npos) {
++    return false;
++  }
++  return true;
++}
++
++bool BypassCudaKernelPass::runImpl(Module &M) {
++  enableLog(M);
++  DEBUG_EXPR(errs() << "run BypassCudaKernelPass when compile file:"
++                    << M.getSourceFileName() << "\n");
++  if (skip(M)) {
++    DEBUG_EXPR(errs() << "skiped!\n");
++    return false;
++  }
++  const char *kPostOrderRootFuncName = "cudaLaunchKernel";
++  const char *k3AngleBracketsCallName = "__cudaPopCallConfiguration";
++
++  if (getEnvValueAs<bool>(DUMP_MODULE_BEFORE)) {
++    M.print(errs(), nullptr);
++  }
++  bool Changed = false;
++  CallGraph cg(M);
++
++  std::map<const Function *, DenseSet<std::pair<CallInst *, const Function *>>>
++      postorderMap;
++
++  // map func ---> <call-func> to <call-func> ---> func
++  for (auto &cf : cg) {
++    for (auto &called : *cf.second) {
++      if (!called.first) {
++        continue;
++      }
++      auto iter =
++          postorderMap.find(cast<CallInst>(called.first)->getCalledFunction());
++      auto callInst = cast<CallInst>(called.first);
++      if (iter == postorderMap.end()) {
++        postorderMap[called.second->getFunction()] = {};
++        postorderMap[called.second->getFunction()].insert(
++            std::make_pair(callInst, cf.first));
++      } else {
++        iter->second.insert(std::make_pair(callInst, cf.first));
++      }
++    }
++  }
++
++  auto launchKernelIter = postorderMap.begin();
++  for (; launchKernelIter != postorderMap.end(); ++launchKernelIter) {
++    if (launchKernelIter->first &&
++        launchKernelIter->first->getName() == kPostOrderRootFuncName) {
++      break;
++    }
++  }
++  if (launchKernelIter == postorderMap.end()) {
++    return false;
++  }
++
++  SmallVector<SmallVector<const Function *, 4>, 4> callStacks;
++
++  // maybe has cycle we need avoid it
++  const size_t kMaxStackDeep = 32;
++  size_t loopCount = 0;
++
++  SmallVector<const Function *, 2> launchKernels;
++  if (launchKernelIter->second.size() != 1) {
++    return false;
++  }
++  launchKernelIter =
++      postorderMap.find(launchKernelIter->second.begin()->second);
++  if (launchKernelIter == postorderMap.end()) {
++    return false;
++  }
++  if (launchKernelIter->first->getName().find(kPostOrderRootFuncName) ==
++      std::string::npos) {
++    return false;
++  }
++
++  struct CudaKernelLauncInfo {
++    CallInst *cfg = nullptr;
++    Function *rootLaunch = nullptr;
++  };
++  auto dfsVisit = [&](auto func, auto &stack) -> auto {
++    // errs() << "dfs root:" << func->getName() << "\n";
++    loopCount = 0;
++    auto callStackIter = postorderMap.find(func);
++    while (callStackIter != postorderMap.end()) {
++      if (callStackIter->second.size() == 1) {
++        stack.push_back(callStackIter->second.begin()->second);
++        callStackIter =
++            postorderMap.find(callStackIter->second.begin()->second);
++      } else {
++        stack.push_back(callStackIter->second.begin()->second);
++        break;
++      }
++      if (loopCount++ > kMaxStackDeep) {
++        return -1;
++      }
++    }
++    return 0;
++  };
++
++  llvm::DenseMap<StringRef, GlobalVariable *> strSymbolCacheTB;
++  auto createReplaceCudaCall = [&](Function *globalFunc, StringRef oldFuncName,
++                                   StringRef newFuncName, Function *parentFunc,
++                                   ArrayRef<CallInst *> orgCalls) {
++    if (!parentFunc) {
++      DEBUG_EXPR(errs() << "warning parentFunc is empty!\n");
++      return false;
++    }
++    auto &callInsts = *cg[parentFunc];
++    if (callInsts.empty()) {
++      DEBUG_EXPR(errs() << "warning callInsts is empty!\n");
++      return false;
++    }
++    for (auto &it : callInsts) {
++      auto callCfg = cast<CallInst>(it.first);
++      if (!it.second) {
++        continue;
++      }
++      if (it.second->getFunction()->getName().find(k3AngleBracketsCallName) ==
++          std::string::npos) {
++        continue;
++      }
++      auto lastIter = parentFunc->getEntryBlock().end();
++      IRBuilder<> builder(&parentFunc->getEntryBlock(), std::prev(lastIter));
++      // for debug
++      auto &llvmCtx = callCfg->getContext();
++      auto strOldFuncName = oldFuncName.str();
++      strOldFuncName.push_back('\0');
++
++      auto debugFuncName = getEnvValueAs<std::string>(DEBUG_FUNC_NAME);
++      if (debugFuncName.empty()) {
++        debugFuncName = "puts";
++      }
++
++      auto debugFunc = const_cast<Function *>(
++          dyn_cast_or_null<const Function>(M.getNamedValue(debugFuncName)));
++      if (!debugFunc) {
++        auto strType = Type::getInt8PtrTy(llvmCtx);
++        auto debugFuncType =
++            FunctionType::get(Type::getInt32Ty(llvmCtx), strType, false);
++        debugFunc = Function::Create(
++            debugFuncType, GlobalValue::ExternalLinkage, debugFuncName, &M);
++        debugFunc->setDSOLocal(true);
++      }
++
++      auto createDebugFunc = [&](IRBuilder<> builder, StringRef str) {
++        auto iter = strSymbolCacheTB.find(str);
++        if (iter == strSymbolCacheTB.end()) {
++          ArrayType *stringType =
++              ArrayType::get(Type::getInt8Ty(llvmCtx), str.size());
++          Constant *strBuf = ConstantDataArray::getString(llvmCtx, str.data());
++          GlobalVariable *globalStr =
++              new GlobalVariable(M, stringType,
++                                 true, // isConstant
++                                 GlobalValue::PrivateLinkage, strBuf, str);
++          iter = strSymbolCacheTB.insert(std::make_pair(str, globalStr)).first;
++        }
++        builder.CreateCall(debugFunc, iter->second);
++      };
++
++      // TODO, call function maybe has cycle,fix this then remove comment
++      if (newFuncName.empty()) {
++        std::string msg =
++            "match fail will call cuda func:\n" + oldFuncName.str();
++        DEBUG_EXPR(errs() << "insert debug msg:" << msg << "\n");
++        builder.SetInsertPoint(callCfg);
++        createDebugFunc(builder, msg);
++        continue;
++      }
++
++      std::string tmpNameString = newFuncName.str();
++      bool bFORWARD_TO_CPU = getEnvValueAs<bool>(FORWARD_TO_CPU);
++      if (bFORWARD_TO_CPU) {
++        tmpNameString = "cpu_wrapper_" + tmpNameString;
++        newFuncName = tmpNameString;
++      }
++      DEBUG_EXPR(errs() << "match success:\n"
++                        << oldFuncName << "\n"
++                        << newFuncName << "\n");
++      auto orgFunc = callCfg->getCalledFunction();
++      auto orgFuncType = parentFunc->getFunctionType();
++      // grad size && block size
++      // why the function can't pass by struct?
++      // SmallVector<Type*, 4> newArgTypes(2);
++      // std::transform(
++      //     callCfg->arg_begin(), callCfg->arg_begin() + 2,
++      //     newArgTypes.begin(),
++      //     [](auto &arg) {
++      //       return arg->getType()->getPointerTo()->getElementType();
++      //     });
++      SmallVector<Type *, 4> newArgTypes{
++          Type::getInt64Ty(llvmCtx), Type::getInt32Ty(llvmCtx),
++          Type::getInt64Ty(llvmCtx), Type::getInt32Ty(llvmCtx)};
++      newArgTypes.append(std::begin(orgFuncType->params()),
++                         std::end(orgFuncType->params()));
++      auto funcType =
++          FunctionType::get(orgFuncType->getReturnType(), newArgTypes, false);
++      // auto orgFunc = callCfg->getCalledFunction();
++      // orgFunc->eraseFromParent();
++
++      Function *dummyFunc = const_cast<Function *>(
++          dyn_cast_or_null<const Function>(M.getNamedValue(newFuncName)));
++      if (!dummyFunc) {
++        dummyFunc =
++            Function::Create(funcType,
++                             bFORWARD_TO_CPU ? GlobalValue::ExternalWeakLinkage
++                                             : GlobalValue::ExternalLinkage,
++                             newFuncName, &M);
++        for (size_t i = 0; i < parentFunc->arg_size(); ++i) {
++          if (globalFunc->hasParamAttribute(i, Attribute::ByVal)) {
++            // TODO: set parent func with byval, then we need not copy and
++            // forward parameter, just direct forward
++            // parentFunc->addParamAttr(i, Attribute::ByVal);
++            dummyFunc->addParamAttr(4 + i, Attribute::ByVal);
++          }
++        }
++        dummyFunc->setDSOLocal(true);
++      }
++
++      auto getDim3Valus = [&](auto dim3) {
++        std::array<Type *, 2> types = {Type::getInt64Ty(llvmCtx),
++                                       Type::getInt32Ty(llvmCtx)};
++        auto bytePtrType = Type::getInt8PtrTy(llvmCtx);
++
++        auto trivialType = StructType::get(llvmCtx, types);
++        auto trivialBuf = builder.CreateAlloca(trivialType);
++
++        builder.CreateMemCpy(trivialBuf, MaybeAlign(), dim3, MaybeAlign(), 12);
++
++        auto ptr0 = builder.CreateStructGEP(trivialType, trivialBuf, 0);
++        auto i64Value = builder.CreateAlignedLoad(types[0], ptr0, 4);
++        auto ptr1 = builder.CreateStructGEP(trivialType, trivialBuf, 1);
++        auto i32Value = builder.CreateAlignedLoad(types[1], ptr1, 4);
++        return std::make_pair(i64Value, i32Value);
++      };
++
++      builder.SetInsertPoint(callCfg->getNextNode());
++      auto grad = getDim3Valus(callCfg->getArgOperand(0));
++      auto block = getDim3Valus(callCfg->getArgOperand(1));
++      SmallVector<Value *, 4> args = {std::get<0>(grad), std::get<1>(grad),
++                                      std::get<0>(block), std::get<1>(block)};
++      for (auto &arg :
++           make_range(parentFunc->arg_begin(), parentFunc->arg_end())) {
++        args.push_back(&arg);
++      }
++#if 0
++      for (size_t i = 0; i < globalFunc->arg_size(); ++i) {
++        if (globalFunc->hasParamAttribute(i, Attribute::ByVal)) {
++          if (auto ppT = dyn_cast<PointerType>(args[4 + i]->getType())) {
++            auto eleType = ppT->getElementType();
++            auto newArg = builder.CreateAlloca(eleType);
++            builder.CreateMemCpy(newArg, MaybeAlign(), args[4 + i],
++                                 MaybeAlign(),
++                                 M.getDataLayout().getTypeAllocSize(eleType));
++            args[4 + i] = newArg;
++          }
++        }
++      }
++#endif
++
++      auto newCall = builder.CreateCall(dummyFunc, args);
++
++      {
++        std::string debug_step = "will call replaced kernel:\n";
++        debug_step += newFuncName.str();
++        debug_step.push_back('\0');
++        builder.SetInsertPoint(newCall);
++        createDebugFunc(builder, debug_step);
++      }
++
++      // callCfg->replaceAllUsesWith(newCall);
++      // callCfg->eraseFromParent();
++    }
++    for (auto orgCall : orgCalls) {
++      orgCall->eraseFromParent();
++    }
++    return true;
++  };
++
++  // TODO refine: direct construct this
++  std::map<const Function *, SmallVector<CallInst *, 4>> uniqueLaunch;
++  for (auto info : launchKernelIter->second) {
++    if (uniqueLaunch.find(info.second) == uniqueLaunch.end()) {
++      (void)uniqueLaunch[info.second];
++    }
++    uniqueLaunch[info.second].push_back(info.first);
++  }
++
++  std::array<StringRef, 3> target_kernel = {
++      "RoIAlignForward", "BatchTranspose2DCUDAKernel", "reduce1d_kernel"};
++
++  StringRef deviceWrapperId = "__device_stub";
++  FunctionMatcher functionMather;
++  for (auto func : uniqueLaunch) {
++    // _Z3addiiPi must has only one wrapper: _Z24__device_stub__Z3addiiPiiiPi
++    auto iter = postorderMap.find(func.first);
++    if (iter == postorderMap.end() || iter->second.size() != 1) {
++      continue;
++    }
++    // we need find the __global__ function name, this name can found by
++    // _ZL16cudaLaunchKernelIcE9cudaErrorPKT_4dim3S4_PPvmP11CUstream_st first
++    // parameter
++    if (func.second.size() == 0) {
++      continue;
++    }
++    auto bitcastOperator =
++        dyn_cast<BitCastOperator>(func.second.front()->getArgOperand(0));
++    if (!bitcastOperator) {
++      continue;
++    }
++    auto bitcastFunc = bitcastOperator->getOperand(0);
++
++    auto targetFunc = dyn_cast<Function>(bitcastFunc);
++    if (!targetFunc) {
++      continue;
++    }
++    auto orgFuncName = targetFunc->getName();
++    functionMather.match(orgFuncName);
++
++    // auto cFuncName = llvm::demangle(orgFuncName);
++    // auto pos = cFuncName.find("(");
++    // cFuncName = cFuncName.substr(0, pos);
++    // pos = orgFuncName.find(cFuncName);
++    // auto newFuncname = (orgFuncName.substr(0, pos + cFuncName.size()) +
++    //                     "4dim3S_" + orgFuncName.substr(pos +
++    //                     cFuncName.size()))
++    //                        .str();
++    auto newFuncname = functionMather.getFoundSymbol();
++    if (createReplaceCudaCall(targetFunc, orgFuncName, newFuncname,
++                              const_cast<Function *>(func.first),
++                              func.second)) {
++      Changed = true;
++    }
++    callStacks.emplace_back();
++    callStacks.back().append(std::begin(launchKernels),
++                             std::end(launchKernels));
++    callStacks.back().emplace_back(launchKernelIter->first);
++    loopCount = 0;
++    // auto ret = dfsVisit(func.first, callStacks.back());
++    // if (ret) {
++    //   errs() << "warning has cycle when dfs the call graph!\n";
++    //   for (auto func : callStacks.back()) {
++    //     // errs() << "# " << func->getName() << "\n";
++    //   }
++    //   // M.print(errs(), nullptr);
++    // }
++  }
++
++  for (auto &stack : callStacks) {
++    // errs() << "====================\n";
++    for (auto func : stack) {
++      // errs() << "# " << func->getName() << "\n";
++    }
++  }
++
++  if (getEnvValueAs<bool>(DUMP_MODULE_AFTER)) {
++    M.print(errs(), nullptr);
++  }
++  return Changed;
++}
++
++ModulePass *llvm::createBypassCudaKernelPass() {
++  return new BypassCudaKernelLegacyPass();
++}
++
++static void addToMPM(const llvm::PassManagerBuilder &Builder,
++                     llvm::legacy::PassManagerBase &PM) {
++  PM.add(new BypassCudaKernelLegacyPass());
++}
++
++static llvm::RegisterStandardPasses
++    Y(llvm::PassManagerBuilder::EP_EnabledOnOptLevel0, addToMPM);
++
++static llvm::RegisterStandardPasses
++    Y1(llvm::PassManagerBuilder::EP_ModuleOptimizerEarly, addToMPM);
++
++/* New PM Registration */
++llvm::PassPluginLibraryInfo getBypassCudaKernelPluginInfo() {
++  return {LLVM_PLUGIN_API_VERSION, "BypassCudaKernel", LLVM_VERSION_STRING,
++          [](PassBuilder &PB) {
++            PB.registerPipelineStartEPCallback([](llvm::ModulePassManager &PM) {
++              PM.addPass(BypassCudaKernelPass());
++            });
++          }};
++}
++
++extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
++llvmGetPassPluginInfo() {
++  return getBypassCudaKernelPluginInfo();
++}
+diff --git a/llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.exports b/llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.exports
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.h b/llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.h
+new file mode 100644
+index 000000000000..2e1c706234ee
+--- /dev/null
++++ b/llvm/lib/Transforms/BypassCudaKernel/BypassCudaKernel.h
+@@ -0,0 +1,23 @@
++#include "llvm/IR/Module.h"
++#include "llvm/IR/PassManager.h"
++
++namespace llvm {
++class BypassCudaKernelPass : public PassInfoMixin<BypassCudaKernelPass> {
++public:
++  BypassCudaKernelPass() {}
++
++  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
++
++  // Glue for old PM
++  bool runImpl(Module &M);
++
++  void enableLog(Module &M);
++
++  bool skip(Module &M);
++
++private:
++};
++
++ModulePass *createBypassCudaKernelPass();
++
++} // namespace llvm
+\ No newline at end of file
+diff --git a/llvm/lib/Transforms/BypassCudaKernel/CMakeLists.txt b/llvm/lib/Transforms/BypassCudaKernel/CMakeLists.txt
+new file mode 100644
+index 000000000000..76213e8bf373
+--- /dev/null
++++ b/llvm/lib/Transforms/BypassCudaKernel/CMakeLists.txt
+@@ -0,0 +1,23 @@
++# If we don't need RTTI or EH, there's no reason to export anything
++# from the BypassCudaKernel plugin.
++if( NOT LLVM_REQUIRES_RTTI )
++  if( NOT LLVM_REQUIRES_EH )
++    set(LLVM_EXPORTED_SYMBOL_FILE ${CMAKE_CURRENT_SOURCE_DIR}/BypassCudaKernel.exports)
++  endif()
++endif()
++
++if(WIN32 OR CYGWIN)
++  set(LLVM_LINK_COMPONENTS Core Support)
++endif()
++
++add_llvm_pass_plugin( LLVMBypassCudaKernel MODULE BUILDTREE_ONLY
++  BypassCudaKernel.cpp
++
++  ADDITIONAL_HEADER_DIRS
++  ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms
++
++  DEPENDS
++  intrinsics_gen
++  PLUGIN_TOOL
++  opt
++  )
+diff --git a/llvm/lib/Transforms/CMakeLists.txt b/llvm/lib/Transforms/CMakeLists.txt
+index dda5f6de11e3..7eac33209c01 100644
+--- a/llvm/lib/Transforms/CMakeLists.txt
++++ b/llvm/lib/Transforms/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_subdirectory(Scalar)
+ add_subdirectory(IPO)
+ add_subdirectory(Vectorize)
+ add_subdirectory(Hello)
++add_subdirectory(BypassCudaKernel)
+ add_subdirectory(ObjCARC)
+ add_subdirectory(Coroutines)
+ add_subdirectory(CFGuard)
+-- 
+2.25.1
+
